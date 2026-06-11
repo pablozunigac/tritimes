@@ -36,6 +36,21 @@ const nextConfig: NextConfig = {
           },
         ],
       },
+      {
+        // Sharded athlete profiles, fetched server-side at render time. Served
+        // as raw gzip bytes (no Content-Encoding) — the server gunzips them.
+        source: "/athlete-shards/:path*",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=300, stale-while-revalidate=604800",
+          },
+          {
+            key: "Content-Type",
+            value: "application/gzip",
+          },
+        ],
+      },
     ];
   },
 };

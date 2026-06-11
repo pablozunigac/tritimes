@@ -1,7 +1,22 @@
 import fs from "fs";
 import path from "path";
 import { gunzipSync } from "zlib";
-import { AggregateStats, AthleteResult, AthleteProfile, AthleteRaceEntry, AthleteSearchEntry, AgeGroupBreakdown, CourseStats, DisciplineStats, GenderBreakdown, HistogramBin, HistogramData, LeaderboardEntry, RaceHistogramData, RaceInfo, RaceStats } from "./types";
+import { AggregateStats, AthleteResult, AthleteProfile, AthleteSearchEntry, AgeGroupBreakdown, CourseStats, DisciplineStats, GenderBreakdown, HistogramBin, HistogramData, LeaderboardEntry, RaceHistogramData, RaceInfo, RaceStats } from "./types";
+
+export const SHARD_COUNT = 1024;
+
+/**
+ * Deterministic djb2 hash of an athlete slug → shard bucket.
+ * MUST stay identical to scripts/build-athlete-shards.js (same algorithm,
+ * same SHARD_COUNT) — see athlete-shards.test.ts for the parity anchor.
+ */
+export function shardId(slug: string): number {
+  let h = 5381;
+  for (let i = 0; i < slug.length; i++) {
+    h = ((h << 5) + h + slug.charCodeAt(i)) >>> 0;
+  }
+  return h % SHARD_COUNT;
+}
 
 interface RaceManifestEntry {
   slug: string;
@@ -207,70 +222,56 @@ export function getDeduplicatedAthleteIndex(): AthleteSearchEntry[] {
   return athleteIndexCache;
 }
 
-// Compact mapping: slug → [[raceSlug, resultId], ...]
-type ProfilesMapping = Record<string, [string, number][]>;
+// Sharded, self-contained athlete profiles built at build time by
+// scripts/build-athlete-shards.js and served as static assets under
+// /athlete-shards/. A request fetches only the one shard it needs (~145KB)
+// from the CDN — no 80MB profiles parse, no per-race CSV parsing. Shards are
+// NOT bundled into the function (1024 × ~145KB would blow the 250MB function
+// size limit); they ship as static files and are fetched over HTTP.
+const shardCache = new Map<number, Record<string, AthleteProfile>>();
 
-let profilesMappingCache: ProfilesMapping | null = null;
-
-function getProfilesMapping(): ProfilesMapping {
-  if (!profilesMappingCache) {
-    const profilesPath = path.join(process.cwd(), "..", "data", "athlete-profiles.json.gz");
-    profilesMappingCache = JSON.parse(gunzipSync(fs.readFileSync(profilesPath)).toString());
-  }
-  return profilesMappingCache!;
+// Origin to fetch our own static shard assets from. On Vercel, VERCEL_URL is
+// the current deployment's host; locally it's the dev/start server.
+function shardOrigin(): string {
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return `http://localhost:${process.env.PORT ?? 3000}`;
 }
 
-export function getAthleteProfile(slug: string): AthleteProfile | null {
-  const mapping = getProfilesMapping();
-  const refs = mapping[slug];
-  if (!refs || refs.length === 0) return null;
-
-  const raceMap = new Map(getRacesInternal().map((r) => [r.slug, r]));
-  const races: AthleteRaceEntry[] = [];
-  let fullName = "";
-  let country = "";
-  let countryISO = "";
-
-  for (const [raceSlug, resultId] of refs) {
-    const race = raceMap.get(raceSlug);
-    const result = getAthleteById(raceSlug, resultId);
-    if (!race || !result) continue;
-
-    fullName = result.fullName;
-    country = result.country;
-    countryISO = result.countryISO;
-
-    const allFinishTimes = getAllResults(raceSlug).map((r) => r.finishSeconds).filter((s) => s > 0);
-    const slowerCount = allFinishTimes.filter((s) => s > result.finishSeconds).length;
-    const overallPercentile = allFinishTimes.length > 0
-      ? Math.round((slowerCount / allFinishTimes.length) * 100)
-      : 0;
-    const distance: "70.3" | "140.6" = raceSlug.startsWith("im703-") ? "70.3" : "140.6";
-
-    races.push({
-      raceSlug: race.slug,
-      raceName: race.name,
-      raceDate: race.date,
-      resultId: result.id,
-      finishTime: result.finishTime,
-      finishSeconds: result.finishSeconds,
-      overallPercentile,
-      distance,
-      ageGroup: result.ageGroup,
-      swimTime: result.swimTime,
-      bikeTime: result.bikeTime,
-      runTime: result.runTime,
-      swimSeconds: result.swimSeconds,
-      bikeSeconds: result.bikeSeconds,
-      runSeconds: result.runSeconds,
+async function loadAthleteShard(id: number): Promise<Record<string, AthleteProfile>> {
+  const cached = shardCache.get(id);
+  if (cached) return cached;
+  try {
+    // On protected (preview) deployments the self-fetch is unauthenticated and
+    // would 401; send the automation-bypass secret when Vercel provides it.
+    // No-op in production, where deployments aren't protected.
+    const headers: Record<string, string> = {};
+    const bypass = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+    if (bypass) headers["x-vercel-protection-bypass"] = bypass;
+    // force-cache keeps this fetch (and thus the page) statically cacheable;
+    // no-store would opt the route into dynamic rendering on every request.
+    const res = await fetch(`${shardOrigin()}/athlete-shards/${id}.json.gz`, {
+      cache: "force-cache",
+      headers,
     });
+    if (res.ok) {
+      const buf = Buffer.from(await res.arrayBuffer());
+      const shard = JSON.parse(gunzipSync(buf).toString()) as Record<string, AthleteProfile>;
+      // Cache only on success — every shard exists, so a failure is transient
+      // (network blip, cold CDN, 401 before bypass). Caching {} here would turn
+      // a transient error into persistent "not found" for the whole shard until
+      // the instance recycles.
+      shardCache.set(id, shard);
+      return shard;
+    }
+  } catch {
+    // Network/parse failure → fall through; don't cache, so the next request retries.
   }
+  return {};
+}
 
-  if (races.length === 0) return null;
-
-  races.sort((a, b) => b.raceDate.localeCompare(a.raceDate));
-
-  return { slug, fullName, country, countryISO, races };
+export async function getAthleteProfile(slug: string): Promise<AthleteProfile | null> {
+  const shard = await loadAthleteShard(shardId(slug));
+  return shard[slug] ?? null;
 }
 
 let courseStatsCache: CourseStats[] | null = null;
