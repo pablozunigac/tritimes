@@ -4,6 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import type { RaceInfo } from "@/lib/types";
 import { getCountryFlag } from "@/lib/flags";
+import { getRaceLocation } from "@/lib/raceLocation";
 import { filterRaces } from "@/lib/race-filter";
 
 function formatDate(iso: string): string {
@@ -110,7 +111,8 @@ export default function RaceList({ races }: { races: RaceInfo[] }) {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {filtered.map((race) => {
-          const flag = getCountryFlag(race.location);
+          const location = getRaceLocation(race);
+          const flag = location ? getCountryFlag(location) : "";
 
           return (
             <Link
@@ -129,7 +131,7 @@ export default function RaceList({ races }: { races: RaceInfo[] }) {
 
               <p className="text-sm text-gray-400 mt-2">
                 {flag && <span className="mr-1.5">{flag}</span>}
-                {race.location}
+                {location}
               </p>
 
               <div className="flex items-center gap-2 mt-3 text-xs text-gray-500">
