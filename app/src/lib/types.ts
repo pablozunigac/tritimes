@@ -28,6 +28,18 @@ export interface AthleteResult {
   status: string;
 }
 
+export interface CourseResult extends AthleteResult {
+  raceSlug: string;
+  year: string;
+}
+
+export interface CourseYearSummaryRow {
+  slug: string;
+  year: string;
+  finishers: number;
+  medianFinish: number;
+}
+
 export interface HistogramBin {
   label: string;
   rangeStart: number;
@@ -92,6 +104,21 @@ export interface RaceInfo {
   finishers: number;
 }
 
+export interface CourseEdition {
+  slug: string;
+  year: string;
+  date: string;
+  finishers: number;
+}
+
+export interface CourseInfo {
+  course: string; // base slug, e.g. "im703-swansea"
+  name: string; // display name with leading year stripped
+  location: string;
+  distance: "70.3" | "140.6";
+  editions: CourseEdition[]; // newest first
+}
+
 export interface DisciplineStats {
   discipline: string;
   fastest: number;
@@ -128,6 +155,8 @@ export interface LeaderboardEntry {
   swimTime: string;
   bikeTime: string;
   runTime: string;
+  raceSlug?: string; // set only on combined (multi-edition) leaderboards
+  year?: string; // set only on combined leaderboards
 }
 
 export interface RaceHistogramData {

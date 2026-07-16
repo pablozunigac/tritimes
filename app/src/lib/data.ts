@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { gunzipSync } from "zlib";
-import { AggregateStats, AthleteResult, AthleteSearchEntry, AgeGroupBreakdown, CourseStats, DisciplineStats, DistanceStats, GenderBreakdown, HistogramBin, HistogramData, LeaderboardEntry, RaceHistogramData, RaceSegmentData, RaceStats } from "./types";
+import { AggregateStats, AthleteResult, AthleteSearchEntry, AgeGroupBreakdown, CourseResult, CourseStats, CourseYearSummaryRow, DisciplineStats, DistanceStats, GenderBreakdown, HistogramBin, HistogramData, LeaderboardEntry, RaceHistogramData, RaceSegmentData, RaceStats } from "./types";
 import { getRaces } from "./races";
 import {
   BIN_SIZES,
@@ -470,9 +470,10 @@ export function getDisciplineHistogram(
   return computeHistogram(allSeconds, athleteSeconds, BIN_SIZES[discipline]);
 }
 
-export function getRaceStats(raceSlug: string): RaceStats {
-  const results = getAllResults(raceSlug);
-
+// Pure race statistics over an already-loaded result set. Split from
+// getRaceStats so the course detail page can compute over a pooled,
+// multi-edition result set, and so it is unit-testable without the corpus.
+export function computeRaceStats(results: AthleteResult[]): RaceStats {
   const disciplineKeys: { key: Discipline; label: string }[] = [
     { key: "swim", label: "Swim" },
     { key: "bike", label: "Bike" },
@@ -495,7 +496,6 @@ export function getRaceStats(raceSlug: string): RaceStats {
     };
   });
 
-  // Gender breakdown
   const genderMap = new Map<string, AthleteResult[]>();
   for (const r of results) {
     const list = genderMap.get(r.gender) || [];
@@ -516,7 +516,6 @@ export function getRaceStats(raceSlug: string): RaceStats {
     })
     .sort((a, b) => b.count - a.count);
 
-  // Age group breakdown
   const ageGroupMap = new Map<string, AthleteResult[]>();
   for (const r of results) {
     const list = ageGroupMap.get(r.ageGroup) || [];
@@ -537,7 +536,6 @@ export function getRaceStats(raceSlug: string): RaceStats {
     })
     .sort((a, b) => b.count - a.count);
 
-  // Top 10 leaderboards by gender
   function buildLeaderboard(gender: string): LeaderboardEntry[] {
     return results
       .filter((r) => r.gender === gender)
@@ -557,54 +555,54 @@ export function getRaceStats(raceSlug: string): RaceStats {
         runTime: r.runTime,
       }));
   }
-  const maleLeaderboard = buildLeaderboard("Male");
-  const femaleLeaderboard = buildLeaderboard("Female");
-
-  // Histograms — use precomputed data if available
-  const precomputed = loadPrecomputedHistograms(raceSlug);
-  const histograms = (() => {
-    if (precomputed) {
-      const toRaceHistogram = (key: Discipline): RaceHistogramData => {
-        const src = precomputed[key]?.overall;
-        if (!src || src.bins.length === 0) {
-          return computeRaceHistogram(results.map((r) => getSeconds(r, key)), BIN_SIZES[key]);
-        }
-        return {
-          bins: src.bins.map((b: PrecomputedBin) => ({
-            label: b.label,
-            rangeStart: b.rangeStart,
-            rangeEnd: b.rangeEnd,
-            count: b.count,
-            isAthlete: false,
-          })),
-          medianSeconds: src.medianSeconds,
-          totalAthletes: src.totalAthletes,
-        };
-      };
-      return {
-        swim: toRaceHistogram("swim"),
-        bike: toRaceHistogram("bike"),
-        run: toRaceHistogram("run"),
-        finish: toRaceHistogram("finish"),
-      };
-    }
-    return {
-      swim: computeRaceHistogram(results.map((r) => r.swimSeconds), BIN_SIZES.swim),
-      bike: computeRaceHistogram(results.map((r) => r.bikeSeconds), BIN_SIZES.bike),
-      run: computeRaceHistogram(results.map((r) => r.runSeconds), BIN_SIZES.run),
-      finish: computeRaceHistogram(results.map((r) => r.finishSeconds), BIN_SIZES.finish),
-    };
-  })();
 
   return {
     totalFinishers: results.length,
     disciplines,
     genderBreakdown,
     ageGroupBreakdown,
-    maleLeaderboard,
-    femaleLeaderboard,
-    histograms,
+    maleLeaderboard: buildLeaderboard("Male"),
+    femaleLeaderboard: buildLeaderboard("Female"),
+    histograms: {
+      swim: computeRaceHistogram(results.map((r) => r.swimSeconds), BIN_SIZES.swim),
+      bike: computeRaceHistogram(results.map((r) => r.bikeSeconds), BIN_SIZES.bike),
+      run: computeRaceHistogram(results.map((r) => r.runSeconds), BIN_SIZES.run),
+      finish: computeRaceHistogram(results.map((r) => r.finishSeconds), BIN_SIZES.finish),
+    },
   };
+}
+
+export function getRaceStats(raceSlug: string): RaceStats {
+  const results = getAllResults(raceSlug);
+  const stats = computeRaceStats(results);
+
+  // Overlay precomputed per-slug histograms when present (race-page perf path).
+  const precomputed = loadPrecomputedHistograms(raceSlug);
+  if (precomputed) {
+    const overlay = (key: keyof RaceStats["histograms"]): RaceHistogramData => {
+      const src = precomputed[key]?.overall;
+      if (!src || src.bins.length === 0) return stats.histograms[key];
+      return {
+        bins: src.bins.map((b: PrecomputedBin) => ({
+          label: b.label,
+          rangeStart: b.rangeStart,
+          rangeEnd: b.rangeEnd,
+          count: b.count,
+          isAthlete: false,
+        })),
+        medianSeconds: src.medianSeconds,
+        totalAthletes: src.totalAthletes,
+      };
+    };
+    stats.histograms = {
+      swim: overlay("swim"),
+      bike: overlay("bike"),
+      run: overlay("run"),
+      finish: overlay("finish"),
+    };
+  }
+
+  return stats;
 }
 
 // Numeric-first ordering: bands with a leading age (e.g. "18-24") sort by that
@@ -664,4 +662,64 @@ export function buildRaceSegmentData(results: AthleteResult[]): RaceSegmentData 
   }
 
   return { swim, bike, run, finish, genderIdx, ageBandIdx, genders, ageBands };
+}
+
+// Pool finisher rows across a course's editions, tagging each with its source
+// edition slug + year so combined leaderboards can link to the right result.
+export function getCourseResults(slugs: string[]): CourseResult[] {
+  const pool: CourseResult[] = [];
+  for (const slug of slugs) {
+    const year = slug.match(/-(\d{4})$/)?.[1] ?? "";
+    for (const r of getAllResults(slug)) {
+      pool.push({ ...r, raceSlug: slug, year });
+    }
+  }
+  return pool;
+}
+
+// Combined top-N leaderboard by fastest finish time across editions. Unlike
+// the per-race leaderboard (ordered by genderRank), rank is recomputed 1..N
+// because genderRank repeats across editions.
+export function buildTopFinishers(
+  results: CourseResult[],
+  gender: string,
+  limit = 10,
+): LeaderboardEntry[] {
+  return results
+    .filter((r) => r.gender === gender && r.finishSeconds > 0)
+    .sort((a, b) => a.finishSeconds - b.finishSeconds)
+    .slice(0, limit)
+    .map((r, i) => ({
+      id: r.id,
+      rank: i + 1,
+      fullName: r.fullName,
+      country: r.country,
+      countryISO: r.countryISO,
+      ageGroup: r.ageGroup,
+      gender: r.gender,
+      finishTime: r.finishTime,
+      swimTime: r.swimTime,
+      bikeTime: r.bikeTime,
+      runTime: r.runTime,
+      raceSlug: r.raceSlug,
+      year: r.year,
+    }));
+}
+
+// Per-edition roll-up for the course page's "All editions" table.
+export function getCourseYearSummary(results: CourseResult[]): CourseYearSummaryRow[] {
+  const byEdition = new Map<string, CourseResult[]>();
+  for (const r of results) {
+    const list = byEdition.get(r.raceSlug) || [];
+    list.push(r);
+    byEdition.set(r.raceSlug, list);
+  }
+  return Array.from(byEdition.entries())
+    .map(([slug, group]) => ({
+      slug,
+      year: group[0].year,
+      finishers: group.length,
+      medianFinish: computeMedian(group.map((r) => r.finishSeconds).filter((s) => s > 0)),
+    }))
+    .sort((a, b) => b.year.localeCompare(a.year));
 }
