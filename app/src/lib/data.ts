@@ -1,8 +1,19 @@
 import fs from "fs";
 import path from "path";
 import { gunzipSync } from "zlib";
-import { AggregateStats, AthleteResult, AthleteSearchEntry, AgeGroupBreakdown, CourseStats, DisciplineStats, DistanceStats, GenderBreakdown, HistogramBin, HistogramData, LeaderboardEntry, RaceHistogramData, RaceStats } from "./types";
+import { AggregateStats, AthleteResult, AthleteSearchEntry, AgeGroupBreakdown, CourseStats, DisciplineStats, DistanceStats, GenderBreakdown, HistogramBin, HistogramData, LeaderboardEntry, RaceHistogramData, RaceSegmentData, RaceStats } from "./types";
 import { getRaces } from "./races";
+import {
+  BIN_SIZES,
+  computeMedian,
+  computeRaceHistogram,
+  deriveAgeBand,
+  formatSecondsShort,
+  type Discipline,
+} from "./histogram";
+
+export type { Discipline } from "./histogram";
+export { BIN_SIZES, computeRaceHistogram } from "./histogram";
 
 // Corpus-reading data access: everything here may reference data/*.csv.gz,
 // data/histograms/* and data/athlete-index.tsv.gz, so any function whose
@@ -319,20 +330,6 @@ export function getStatsPageData(): StatsPageData {
   };
 }
 
-function formatSecondsShort(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  if (h > 0) return `${h}:${String(m).padStart(2, "0")}`;
-  return `${m}m`;
-}
-
-function computeMedian(values: number[]): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
 export function computeHistogram(
   allSeconds: number[],
   athleteSeconds: number,
@@ -370,17 +367,6 @@ export function computeHistogram(
 
   return { bins, athleteSeconds, athletePercentile, medianSeconds };
 }
-
-export type Discipline = "swim" | "bike" | "run" | "finish" | "t1" | "t2";
-
-const BIN_SIZES: Record<Discipline, number> = {
-  swim: 300,    // 5-minute bins
-  bike: 600,    // 10-minute bins
-  run: 600,     // 10-minute bins
-  finish: 600,  // 10-minute bins
-  t1: 60,       // 1-minute bins
-  t2: 60,       // 1-minute bins
-};
 
 function getSeconds(r: AthleteResult, discipline: Discipline): number {
   switch (discipline) {
@@ -482,35 +468,6 @@ export function getDisciplineHistogram(
 
   const allSeconds = pool.map((r) => getSeconds(r, discipline));
   return computeHistogram(allSeconds, athleteSeconds, BIN_SIZES[discipline]);
-}
-
-export function computeRaceHistogram(
-  allSeconds: number[],
-  binSize: number
-): RaceHistogramData {
-  const valid = allSeconds.filter((s) => s > 0);
-  if (valid.length === 0) {
-    return { bins: [], medianSeconds: 0, totalAthletes: 0 };
-  }
-
-  const min = Math.floor(Math.min(...valid) / binSize) * binSize;
-  const max = Math.ceil(Math.max(...valid) / binSize) * binSize;
-
-  const bins: HistogramBin[] = [];
-  for (let start = min; start < max; start += binSize) {
-    const end = start + binSize;
-    const count = valid.filter((s) => s >= start && s < end).length;
-    bins.push({
-      label: formatSecondsShort(start),
-      rangeStart: start,
-      rangeEnd: end,
-      count,
-      isAthlete: false,
-    });
-  }
-
-  const medianSeconds = computeMedian(valid);
-  return { bins, medianSeconds, totalAthletes: valid.length };
 }
 
 export function getRaceStats(raceSlug: string): RaceStats {
@@ -648,4 +605,63 @@ export function getRaceStats(raceSlug: string): RaceStats {
     femaleLeaderboard,
     histograms,
   };
+}
+
+// Numeric-first ordering: bands with a leading age (e.g. "18-24") sort by that
+// age ascending; non-numeric bands (e.g. "PRO") come after, alphabetically.
+function compareAgeBands(a: string, b: string): number {
+  const na = parseInt(a, 10);
+  const nb = parseInt(b, 10);
+  const aNum = !Number.isNaN(na);
+  const bNum = !Number.isNaN(nb);
+  if (aNum && bNum) return na - nb;
+  if (aNum) return -1;
+  if (bNum) return 1;
+  return a.localeCompare(b);
+}
+
+export function getRaceSegmentData(raceSlug: string): RaceSegmentData {
+  return buildRaceSegmentData(getAllResults(raceSlug));
+}
+
+// Pure transform from finisher results to the compact client payload. Split
+// from getRaceSegmentData so it can be tested with synthetic data — the CSV
+// corpus (data/*.csv.gz) is generated at build time and absent in the `npm
+// test` CI job, so a test that reads a real race gets empty arrays.
+export function buildRaceSegmentData(results: AthleteResult[]): RaceSegmentData {
+  // Build ordered label tables first.
+  const GENDER_ORDER: Record<string, number> = { Male: 0, Female: 1 };
+  const genders = Array.from(new Set(results.map((r) => r.gender)))
+    .filter((g) => g)
+    .sort((a, b) => {
+      const ra = GENDER_ORDER[a] ?? 2;
+      const rb = GENDER_ORDER[b] ?? 2;
+      return ra !== rb ? ra - rb : a.localeCompare(b);
+    });
+  const ageBands = Array.from(
+    new Set(results.map((r) => deriveAgeBand(r.ageGroup)))
+  )
+    .filter((b) => b)
+    .sort(compareAgeBands);
+
+  const genderPos = new Map(genders.map((g, i) => [g, i]));
+  const bandPos = new Map(ageBands.map((b, i) => [b, i]));
+
+  const swim: number[] = [];
+  const bike: number[] = [];
+  const run: number[] = [];
+  const finish: number[] = [];
+  const genderIdx: number[] = [];
+  const ageBandIdx: number[] = [];
+
+  for (const r of results) {
+    swim.push(r.swimSeconds);
+    bike.push(r.bikeSeconds);
+    run.push(r.runSeconds);
+    finish.push(r.finishSeconds);
+    genderIdx.push(genderPos.get(r.gender) ?? -1);
+    ageBandIdx.push(bandPos.get(deriveAgeBand(r.ageGroup)) ?? -1);
+  }
+
+  return { swim, bike, run, finish, genderIdx, ageBandIdx, genders, ageBands };
 }
